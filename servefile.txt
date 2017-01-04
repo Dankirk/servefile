@@ -1,0 +1,361 @@
+alias servestart {
+  var %target = $1
+  var %file = $noqt($2-)
+  var %dir = 0
+
+  if ($isdir(%file)) {
+    %dir = 1
+    var %files = $findfile(%file,*,0,noop)
+
+    if (%files == 0) { return }
+    else if (%files >= 5) {
+      if (!$?!=" $+ $nopath(%file) has %files files in it. $crlf It's recommended to pack these files before sharing. $crlf $crlf Do you still want to share the files individually $+ ?") {
+        return
+      }
+    }
+  }
+
+  ; Setup webserver and return if an error occurred
+  if ($setup_webserver() == 0) { return }
+
+  if (%dir) { noop $findfile(%file,*,0,sharefile %target $1-) }
+  else { sharefile %target %file }
+}
+
+alias -l setup_webserver {
+
+  ; Read settings from .ini file
+  var %myserver = $readini(servefile.ini,n,settings,ip)
+  if (!%myserver) { %myserver = $ip }
+
+  var %port = $readini(servefile.ini,n,settings,port) 
+  if (!%port) { %port = 81 }
+
+  var %servetime = $readini(servefile.ini,n,settings,servetime) 
+  if (!%servetime) { %servetime = 3600 }
+
+  var %max_dowload_time = $readini(servefile.ini,n,settings,max_dowload_time) 
+  if (!%max_dowload_time) { %max_dowload_time = 1800 }
+
+  var %max_clients = $readini(servefile.ini,n,settings,max_clients) 
+  if (!%max_clients) { %max_clients = 50 }
+
+  ; Unshare any files left hanging (due to power loss, crash, etc)
+  var %i = $var(%servefile.file.*,0)
+  while (%i > 0) {
+    if ($var(%servefile.file.*,%i).secs <= 0) { 
+      unset [ $var(%servefile.file.*,%i) ]
+    }
+    dec %i
+  }
+
+  ; If port has been changed we need to restart the webserver
+  ; However, leave already open connections intact
+  if ($sock(servefile) && $sock(servefile).port != %port) { 
+    sockclose servefile
+    .timerservefile off
+  }
+
+  ; Start listening for clients. 
+  ; If UPnP is enabled, portforward automatically (-p)
+  if (!$sock(servefile)) {
+    if (!$portfree(%port)) {
+      echo %target ServeFile - Port %port is in use. Cannot create webserver.
+      return 0
+    }
+    socklisten -p servefile %port
+  }
+  sockmark servefile %max_clients
+
+  set -eu0 %servefile.webroot http:// $+ %myserver $+ : $+ %port $+ /
+  set -eu0 %servefile.servetime %servetime
+
+  .timerservefile 1 %servetime sockclose servefile
+  .timerservefile.cleanup $ceil($calc(%servetime / 10)) 10 servefile.cleanup %max_dowload_time
+
+  return 1
+}
+
+alias -l sharefile {
+
+  var %target = $1
+  var %file = $2-
+
+  ; Generate a random string to prevent collision with files that have same name.
+  ; If a particular file is already being shared, just reset the share timers
+  var %id = 0
+  var %randomname
+  var %i = 1
+  while (%i <= $var(%servefile.file.*,0)) {
+    if ($var(%servefile.file.*,%i).value == %file) {
+      %randomname = $gettok($var(%servefile.file.*,%i),-1,46)
+      break
+    }
+    inc %i
+  }
+
+  if (!%randomname) { 
+    while (!%randomname || %servefile.file. [ $+ [ %randomname ] ] ) { 
+      %randomname = $randomstring()
+    }
+  }
+
+  var %video_extensions = mp4 ogg webm
+  var %is_video = $istok(%video_extensions, $gettok(%file,-1,46), 32)
+
+  var %audio_extensions = mp3 aac
+  var %is_audio = $istok(%audio_extensions, $gettok(%file,-1,46), 32)
+
+  ; Share the file and post a link to it
+  set -eu [ $+ [ %servefile.servetime ] ] %servefile.file. $+ %randomname %file
+  msg %target %servefile.webroot $+ %randomname $+ / $+ $urlEncode($nopath(%file)) $+ $iif(%is_video || %is_audio, ?player=1)
+}
+
+alias -l urlDecode return $utfdecode($regsubex($replace($1, +, $chr(32)), /%([A-F\d]{2})/gi, $chr($base(\1, 16, 10))))
+alias -l UrlEncode return $replace($regsubex($1-,/([^\d\w\-\_\.\!\'\(\) ])/g,$+(%,$base($asc(\t),10,16))),$chr(32),+)
+
+; Just in case a browser doesn't play nicely, 
+; we should disconnect them from our end after a timeout
+alias -l servefile.cleanup {
+  var %id = $sock(servefile.*,0)
+  while (%id > 0) {
+    if ($sock(servefile.*,%id).to > $1) {
+      if ($gettok($sock(servefile.*,%id).mark,1,32) == content) {
+        .fclose $gettok($sock(servefile.*,%id).mark,2,32)
+      }
+      sockclose $sock(servefile.*,%id)
+    }
+    dec %id
+  }
+}
+
+alias -l randomstring {
+  var %length  = 8
+  var %ret
+  while (%length > 0) {
+    var %r = $rand(1,2)
+    if (%r == 1) {
+      %ret = %ret $+ $rand(a,z)
+    }
+    else {
+      %ret = %ret $+ $rand(0,9)
+    }
+    dec %length
+  }
+  return %ret
+}
+
+; Returns path to an actual file on harddrive corresponding the requested URL
+; If no shared file corresponds to given URL, returns null instead
+alias -l getRealPath {
+  var %path = %servefile.file. [ $+ [ $gettok($1-,1,47) ] ]
+  if (%path && $nopath(%path) == $gettok($1-,2-,47)) {
+    return %path
+  }
+  return $null
+}
+
+on 1:socklisten:servefile:{
+
+  if ($sockerr) { return }
+
+  ; Give an ID for connecting client,
+  ; unless we already have too many clients
+  var %id = 0
+  while ($sock(servefile. $+ %id)) { 
+    if (%id >= $sock($sockname).mark) { return }
+    inc %id
+  }
+
+  sockaccept servefile. $+ %id
+}
+
+on 1:sockread:servefile.*:{
+  if ($sockerr) { return }
+
+  ; HTTP states that client should make a new connection for each request.
+  ; So ignore further requests, if we are alredy handling a file for this client.
+  if ($gettok($sock($sockname).mark,1,32) == content) {
+    return
+  }
+
+  var %buffer
+  var %file
+  var %byterange = 0
+  while ($sock($sockname)) {
+    sockread -n %buffer
+    if ($sockbr == 0) { break }
+
+    ; We only need to handle GET requests from browser
+    ; Anything else is irrelevant for our purposes
+    if (!%file && $gettok(%buffer,1,32) == GET) {
+      %file = $urlDecode($right($gettok(%buffer,2,32),-1))
+    }
+    if (%file && $gettok(%buffer,1,61) == Range: bytes) {
+      %byterange = $gettok(%buffer,2,61)
+    }
+  }
+
+  if (%file) { noop $serve($sockname, %byterange, %file) }
+}
+
+; We can only close sockets after all data has been written (after sockwrite event occurs and socket.sq == 0)
+; Also we can't queue big files all at once, so send 8192 bytes at a time
+on 1:sockwrite:servefile.*:{
+  var %status = $gettok($sock($sockname).mark,1,32)
+  var %stream = $gettok($sock($sockname).mark,2,32)
+  var %range_max = $gettok($sock($sockname).mark,3,32)
+
+  if ($sockerr) {
+    if (%status == content) { .fclose %stream }
+    sockclose $sockname
+    return
+  }
+
+  if (%status == content) {
+
+    ; Calculate how many bytes should we send. 
+    ; Don't read past the requested byte range or queue more than 16384 bytes at a time
+    var %toreadmax = $iif($calc(%range_max - $fopen(%stream).pos) < 8192, $calc($v1 + 1), 8192)
+    var %toread = $iif($calc(16384 - $sock($sockname).sq - %toreadmax) >= 0, %toreadmax, $calc(%toreadmax + $v1))
+
+    ; echo -a Servefile: Reading %toread queue: $sock($sockname).sq
+
+    if (%toreadmax <= 0) {
+      .fclose %stream
+      sockmark $sockname
+    }
+
+    if (%toread <= 0) { return }
+
+    if ($fread(%stream, %toread, &buffer) > 0) {
+      sockwrite $sockname &buffer
+    }
+
+    if ($fopen(%stream).eof || $fopen(%stream).err) {
+      if ($sock($sockname).sq == 0) { sockmark $sockname done }
+      else { sockmark $sockname finalizing }
+      .fclose %stream
+    }
+  }
+}
+
+; If a connection gets interrupted, be sure to close any files we were sending
+on 1:sockclose:servefile.*:{
+  if ($gettok($sock($sockname).mark,1,32) == content) {
+    .fclose $gettok($sock($sockname).mark,2,32)
+  }
+}
+
+alias -l respond_notfound {
+
+  var %html = <!DOCTYPE html><html><body><h1>Not Found</h1></body></html>
+
+  sockmark $1 done
+
+  sockwrite -n $1 HTTP/1.1 404 Not Found
+  sockwrite -n $1 Content-Type: text/html
+  sockwrite -n $1 Content-Length: $length(%html)
+  sockwrite -n $1 Connection: close
+  sockwrite -n $1
+  sockwrite -n $1 %html
+}
+
+alias -l respond_embedded_player {
+
+  var %audio_extensions = mp3 aac
+  var %is_audio = $istok(%audio_extensions, $gettok($2-,-1,46), 32)
+  var %element = $iif(%is_audio, audio, video)
+
+  var %html = <!DOCTYPE html> $&
+    <html style="height:100%;"> $&
+    <body> $&
+    < $+ %element id="media" controls autoplay> $&
+    <source src=" $+ $2- $+ ">Your browser doesn't support HTML5 $&
+    </ $+ %element $+ > $& 
+    <a target="_blank" href=" $+ $2- $+ ?dl=1">Download</a> $&
+    <script> $&
+    var e = document.getElementById("media"); $&
+    if (e.requestFullscreen) e.requestFullscreen(); $&
+    </script> $&
+    </body> $&
+    </html>
+
+  sockmark $1 done
+
+  sockwrite -n $1 HTTP/1.1 200 OK
+  sockwrite -n $1 Content-Type: text/html
+  sockwrite -n $1 Content-Length: $length(%html)
+  sockwrite -n $1 Connection: close
+  sockwrite -n $1
+  sockwrite -n $1 %html
+}
+
+alias -l serve {
+  var %path = $getRealPath($gettok($3-,1,63))
+
+  if (!%path) {
+    respond_notfound $1 $3-
+    return
+  }
+
+  var %params = $gettok($3-,2,63)
+  var %embed_player = $istok(%params, player=1, 38)
+  var %download = $istok(%params, dl=1, 38)
+
+  if (%embed_player) {
+    respond_embedded_player $1 $urlEncode($nopath(%path))
+    return
+  }
+
+  var %id = 0
+  while ($fopen(servefile. $+ %id)) { inc %id }
+  var %stream = servefile. $+ %id
+  .fopen %stream $qt(%path)
+
+  if ($fopen(%stream).err) {
+    echo -ta Servefile: Unable to access shared file: %path
+    .fclose %stream    
+    respond_notfound $1 %path
+    return
+  }
+
+  ; If a specific range is requested, seek to beginning of that position
+  var %valid_range = $iif($regex($2, ^\d+[\-\d+]$) == 1, 1, 0)
+
+  var %filesize = $file(%path).size
+  var %byterange_min = $iif(%valid_range && $gettok($2,1,45) >= 0, $v1, 0)
+  var %byterange_max = $iif(%valid_range && $numtok($2,45) == 2 && $gettok($2,2,45) >= %byterange_min, $v1, $calc(%filesize - 1))
+  var %partial = $iif($chr(45) isin $2, 1, 0)
+
+  .fseek %stream %byterange_min
+
+  if ($fopen(%stream).err || $fopen(%stream).eof) {
+    .fclose %stream    
+    respond_notfound $1 %path
+    return
+  }
+
+  echo -a $timestamp Servefile: $sock($1).ip requested a shared file: $nopath(%path)
+
+  ; If sharing a file with web content, force plain text mode.
+  ; Otherwise let browser decide
+  var %web_extensions = acgi htm html htmls htt htx shtml php asp aspx css cer csr js jsp rss xhtml
+  var %force_plaintext = $istok(%web_extensions, $gettok(%path,-1,46), 32)
+
+  sockmark $1 content %stream %byterange_max
+
+  sockwrite -n $1 HTTP/1.1 $iif(%partial, 206 Partial Content, 200 OK)
+  sockwrite -n $1 Content-Disposition: $iif(%download,attachment;) filename=" $+ $nopath(%path) $+ "
+  sockwrite -n $1 Content-Length: $calc(%byterange_max - %byterange_min + 1)
+  if (%partial) {
+    echo -a $timestamp Servefile: $sock($1).ip resuming $nopath(%path) from %byterange_min to %byterange_max ( %filesize )
+    sockwrite -n $1 Accept-Ranges: bytes
+    sockwrite -n $1 Content-Range: bytes %byterange_min $+ - $+ %byterange_max $+ / $+ %filesize
+  }
+  if (%force_plaintext) {
+    sockwrite -n $1 Content-Type: text/plain
+  }
+  sockwrite -n $1 Connection: close
+  sockwrite -n $1
+}
