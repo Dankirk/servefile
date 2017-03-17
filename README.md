@@ -2,7 +2,7 @@
 # Description
 a mIRC script for sharing drag&dropped files with your friends on IRC.
 
-#How does it work?
+# What does it do and how?
 
 When you drag&drop file(s) or folder(s) on a channel or query window the script creates a temporary webserver, and then pastes an URL to the shared files to the target window. Other users can then simply double click the URLs to access files with their favorite browser.
 
